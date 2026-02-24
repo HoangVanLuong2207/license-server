@@ -73,9 +73,14 @@ class VerifyRequest(BaseModel):
 
 class CreateKeyRequest(BaseModel):
     admin_password: str
-    days: Optional[int] = None  # None = vĩnh viễn
+    days: Optional[int] = None  # Số ngày (tùy chọn)
+    custom_date: Optional[str] = None # YYYY-MM-DD (tùy chọn)
     max_devices: int = 1
     note: str = ""
+
+class ExtendKeyRequest(BaseModel):
+    admin_password: str
+    days: int
 
 # ============================================================
 # ADMIN AUTH
@@ -159,15 +164,21 @@ async def create_key(req: CreateKeyRequest):
     new_key = secrets.token_hex(16).upper()
     new_key = "-".join([new_key[i:i+4] for i in range(0, 16, 4)])
 
-    now = datetime.now().isoformat()
+    now = datetime.now()
     expires = None
-    if req.days and req.days > 0:
-        expires = (datetime.now() + timedelta(days=req.days)).isoformat()
+
+    if req.custom_date:
+        try:
+            expires = datetime.fromisoformat(req.custom_date).replace(hour=23, minute=59, second=59).isoformat()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Định dạng ngày không hợp lệ (YYYY-MM-DD)")
+    elif req.days and req.days > 0:
+        expires = (now + timedelta(days=req.days)).isoformat()
 
     await client.execute(
         """INSERT INTO license_keys (key, created_at, expires_at, max_devices, note)
            VALUES (?, ?, ?, ?, ?)""",
-        (new_key, now, expires, req.max_devices, req.note)
+        (new_key, now.isoformat(), expires, req.max_devices, req.note)
     )
 
     return {
@@ -176,6 +187,32 @@ async def create_key(req: CreateKeyRequest):
         "max_devices": req.max_devices,
         "note": req.note,
     }
+
+@app.put("/api/admin/keys/{key}/extend")
+async def extend_key(key: str, req: ExtendKeyRequest):
+    """Gia hạn thêm ngày cho key."""
+    check_admin(req.admin_password)
+
+    rs = await client.execute("SELECT expires_at FROM license_keys WHERE key = ?", (key,))
+    if not rs.rows:
+        raise HTTPException(status_code=404, detail="Key không tồn tại")
+    
+    current_expires = rs.rows[0][0]
+    
+    # Nếu đang vĩnh viễn (expires_at = NULL), không cần gia hạn trừ khi set lại
+    if current_expires is None:
+        return {"message": "Key đang là vĩnh viễn, không cần gia hạn", "expires_at": None}
+
+    base_date = datetime.fromisoformat(current_expires)
+    # Nếu đã hết hạn thì tính từ thời điểm hiện tại, nếu chưa thì cộng dồn
+    if base_date < datetime.now():
+        base_date = datetime.now()
+    
+    new_expires = (base_date + timedelta(days=req.days)).isoformat()
+    
+    await client.execute("UPDATE license_keys SET expires_at = ? WHERE key = ?", (new_expires, key))
+    
+    return {"message": f"Đã gia hạn thêm {req.days} ngày", "new_expires": new_expires}
 
 @app.get("/api/admin/keys")
 async def list_keys(admin_password: str):
@@ -396,14 +433,18 @@ ADMIN_HTML = """<!DOCTYPE html>
       <div class="create-form">
         <div class="field">
           <label>Thời hạn</label>
-          <select id="keyDays">
+          <select id="keyDays" onchange="toggleCustomDate()">
             <option value="0">Vĩnh viễn</option>
             <option value="7">7 ngày</option>
             <option value="30" selected>30 ngày</option>
             <option value="90">90 ngày</option>
-            <option value="180">180 ngày</option>
             <option value="365">1 năm</option>
+            <option value="custom">Chọn ngày cụ thể...</option>
           </select>
+        </div>
+        <div id="customDateContainer" class="field hidden">
+          <label>Ngày hết hạn</label>
+          <input type="date" id="keyCustomDate">
         </div>
         <div class="field">
           <label>Ghi chú</label>
@@ -484,30 +525,80 @@ async function loadKeys() {
       <td>${hwid}</td>
       <td>${k.note || '—'}</td>
       <td class="actions">
-        ${k.is_active
-          ? `<button class="btn btn-danger btn-sm" onclick="revokeKey('${k.key}')">Khóa</button>`
-          : `<button class="btn btn-success btn-sm" onclick="activateKey('${k.key}')">Mở</button>`
-        }
-        <button class="btn btn-warning btn-sm" onclick="resetHwid('${k.key}')">Reset HWID</button>
+        <div style="display:flex; flex-direction:column; gap:4px">
+          <div class="actions">
+            ${k.is_active
+              ? `<button class="btn btn-danger btn-sm" onclick="revokeKey('${k.key}')">Khóa</button>`
+              : `<button class="btn btn-success btn-sm" onclick="activateKey('${k.key}')">Mở</button>`
+            }
+            <button class="btn btn-warning btn-sm" onclick="resetHwid('${k.key}')">Reset HWID</button>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary btn-sm" onclick="extendKeyPrompt('${k.key}')">➕ Gia hạn</button>
+          </div>
+        </div>
       </td>
     `;
     tbody.appendChild(row);
   });
 }
 
+function toggleCustomDate() {
+  const val = document.getElementById('keyDays').value;
+  const container = document.getElementById('customDateContainer');
+  if (val === 'custom') container.classList.remove('hidden');
+  else container.classList.add('hidden');
+}
+
 async function createKey() {
-  const days = parseInt(document.getElementById('keyDays').value) || null;
+  const type = document.getElementById('keyDays').value;
+  let days = null;
+  let custom_date = null;
+
+  if (type === 'custom') {
+    custom_date = document.getElementById('keyCustomDate').value;
+    if (!custom_date) { toast('Vui lòng chọn ngày!', 'error'); return; }
+  } else {
+    days = parseInt(type) || null;
+  }
+  
   const note = document.getElementById('keyNote').value;
 
   const res = await fetch(`${API}/api/admin/keys`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ admin_password: ADMIN_PASS, days, note })
+    body: JSON.stringify({ admin_password: ADMIN_PASS, days, custom_date, note })
   });
+  if (!res.ok) {
+    const err = await res.json();
+    toast(err.detail || 'Lỗi khi tạo key', 'error');
+    return;
+  }
   const data = await res.json();
   toast(`Key tạo thành công: ${data.key}`);
   document.getElementById('keyNote').value = '';
   loadKeys();
+}
+
+async function extendKeyPrompt(key) {
+  const days = prompt(`Gia hạn thêm bao nhiêu ngày cho key ${key}?`, "30");
+  if (days === null || days === "") return;
+  const daysInt = parseInt(days);
+  if (isNaN(daysInt)) { toast('Số ngày không hợp lệ', 'error'); return; }
+
+  const res = await fetch(`${API}/api/admin/keys/${key}/extend`, {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ admin_password: ADMIN_PASS, days: daysInt })
+  });
+  
+  if (res.ok) {
+    toast(`Đã gia hạn thêm ${daysInt} ngày`);
+    loadKeys();
+  } else {
+    const err = await res.json();
+    toast(err.detail || 'Lỗi gia hạn', 'error');
+  }
 }
 
 async function revokeKey(key) {
