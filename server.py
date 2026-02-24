@@ -33,6 +33,10 @@ TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") # Auth Token từ Turso
 if not TURSO_URL:
     # Nếu không có Turso URL, dùng SQLite local làm fallback
     TURSO_URL = "file:license.db"
+else:
+    # Render đôi khi lỗi WebSocket (505), nên ép dùng HTTPS nếu là link libsql://
+    if TURSO_URL.startswith("libsql://"):
+        TURSO_URL = TURSO_URL.replace("libsql://", "https://", 1)
 
 app = FastAPI(title="License Key Server", version="1.0")
 
@@ -44,6 +48,7 @@ app.add_middleware(
 )
 
 # Khởi tạo client Turso
+print(f"[*] Đang kết nối Database: {TURSO_URL.split('://')[0]}://***")
 client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
 
 # ============================================================
