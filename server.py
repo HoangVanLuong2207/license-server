@@ -7,6 +7,7 @@ Endpoints:
   POST /api/admin/keys    — Tạo key mới
   GET  /api/admin/keys    — Danh sách key
   DELETE /api/admin/keys/{key} — Xóa/revoke key
+  GET  /ping              — Health check (keep-alive)
   GET  /                  — Admin panel HTML
 """
 
@@ -105,6 +106,11 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await client.close()
+
+@app.get("/ping")
+async def ping():
+    """Health check — dùng để ping giữ server không bị ngủ."""
+    return {"status": "ok"}
 
 @app.post("/api/verify")
 async def verify_key(req: VerifyRequest):
