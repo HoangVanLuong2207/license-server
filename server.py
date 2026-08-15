@@ -62,15 +62,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Khởi tạo client Turso
-print(f"[*] Connecting Database: {TURSO_URL.split('://')[0]}://***")
-client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+# Client Turso phải được tạo sau khi Uvicorn đã khởi động event loop.
+client = None
 
 # ============================================================
 # DATABASE
 # ============================================================
 async def init_db():
     """Tạo bảng nếu chưa tồn tại."""
+    if client is None:
+        raise RuntimeError("Database client chưa được khởi tạo")
     await client.execute("""
         CREATE TABLE IF NOT EXISTS license_keys (
             key TEXT PRIMARY KEY,
@@ -156,11 +157,17 @@ def check_verify_rate(request: Request, key: str):
 
 @app.on_event("startup")
 async def startup():
+    global client
+    print(f"[*] Connecting Database: {TURSO_URL.split('://')[0]}://***")
+    client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
     await init_db()
 
 @app.on_event("shutdown")
 async def shutdown():
-    await client.close()
+    global client
+    if client is not None:
+        await client.close()
+        client = None
 
 @app.get("/ping")
 async def ping():
