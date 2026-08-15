@@ -1,6 +1,7 @@
 # License Key Server (Turso / libSQL Edition)
 
-Server API quản lý license key cho tool Garena Account Manager, sử dụng Turso (libSQL) để lưu trữ cloud cực nhanh.
+Server API quản lý license key cho ToolAOV, sử dụng Turso (libSQL) và token
+Ed25519 ngắn hạn. Mỗi phản hồi xác thực được ký kèm key, HWID, nonce và hạn token.
 
 ## Cài đặt
 
@@ -42,3 +43,19 @@ Hoặc deploy lên **Render.com** (free):
 3. Build command: `pip install -r requirements.txt`
 4. Start command: `uvicorn server:app --host 0.0.0.0 --port $PORT`
 5. Thêm Environment Variable: `ADMIN_PASSWORD`
+
+## Biến ký token bắt buộc
+
+Ngoài cấu hình Turso, production bắt buộc có:
+
+```text
+LICENSE_SIGNING_PRIVATE_KEY=<Ed25519 private key base64>
+```
+
+Private key đã tạo cho bản client hiện tại nằm trong file `.env` cục bộ (file
+này được `.gitignore`). Sao chép giá trị đó vào Environment của Render, tuyệt
+đối không commit hoặc gửi kèm bản ToolAOV. Public key tương ứng đã được nhúng
+trong client nên khi đổi key pair phải build lại client.
+
+`POST /api/verify` hiện yêu cầu `key`, `hwid`, `nonce` và trả thêm token ký số
+có hiệu lực 5 phút. Client cũ chưa gửi nonce sẽ không còn tương thích.

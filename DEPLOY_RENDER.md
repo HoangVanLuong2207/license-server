@@ -28,9 +28,14 @@ Vào tab **Environment** trong trang quản lý của Render và thêm các bi�
 | `ADMIN_PASSWORD` | `Mật-khẩu-của-bạn` | Dùng để đăng nhập vào trang Admin Panel. |
 | `TURSO_URL` | `libsql://your-db-name.turso.io` | Copy từ Dashboard của Turso. |
 | `TURSO_AUTH_TOKEN` | `ey...your-token...` | Token dùng để kết nối Database. |
+| `LICENSE_SIGNING_PRIVATE_KEY` | Giá trị trong file `.env` cục bộ | Private key Ed25519 để ký token xác thực. |
 
 > [!IMPORTANT]
 > Nếu bạn không cấu hình `TURSO_URL`, server sẽ tự động tạo file `license.db` ngay trên Render. Tuy nhiên, ở bản **Free**, file này sẽ bị **XÓA SẠCH** mỗi khi server restart. **Bắt buộc dùng Turso để lưu dữ liệu vĩnh viễn.**
+
+> `LICENSE_SIGNING_PRIVATE_KEY` cũng là bắt buộc. Không đưa giá trị này lên
+> GitHub và không nhúng vào client; thiếu biến này server sẽ chủ động không
+> khởi động để tránh phát hành phản hồi không được ký.
 
 ## 📈 Bước 4: Kiểm tra và Kết nối
 1. Sau khi Render báo **"Live"**, copy URL của bạn (VD: `https://garena-license.onrender.com`).

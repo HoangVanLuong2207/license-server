@@ -12,24 +12,38 @@ Endpoints:
 """
 
 import hashlib
+import base64
+import json
 import os
 import secrets
 import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 import libsql_client
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")  # Đổi khi deploy!
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 TURSO_URL = os.environ.get("TURSO_URL")         # libSQL URL (VD: libsql://db-name.turso.io)
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") # Auth Token từ Turso
+SIGNING_PRIVATE_KEY_B64 = os.environ.get("LICENSE_SIGNING_PRIVATE_KEY", "")
+
+if not SIGNING_PRIVATE_KEY_B64:
+    raise RuntimeError("Thiếu biến môi trường LICENSE_SIGNING_PRIVATE_KEY")
+try:
+    SIGNING_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(
+        base64.b64decode(SIGNING_PRIVATE_KEY_B64, validate=True)
+    )
+except Exception as error:
+    raise RuntimeError("LICENSE_SIGNING_PRIVATE_KEY không phải Ed25519 private key base64 hợp lệ") from error
 
 if not TURSO_URL:
     # Nếu không có Turso URL, dùng SQLite local làm fallback
@@ -49,7 +63,7 @@ app.add_middleware(
 )
 
 # Khởi tạo client Turso
-print(f"[*] Đang kết nối Database: {TURSO_URL.split('://')[0]}://***")
+print(f"[*] Connecting Database: {TURSO_URL.split('://')[0]}://***")
 client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
 
 # ============================================================
@@ -74,8 +88,9 @@ async def init_db():
 # MODELS
 # ============================================================
 class VerifyRequest(BaseModel):
-    key: str
-    hwid: str
+    key: str = Field(min_length=8, max_length=128)
+    hwid: str = Field(min_length=16, max_length=128)
+    nonce: str = Field(min_length=16, max_length=128)
 
 class CreateKeyRequest(BaseModel):
     admin_password: str
@@ -92,8 +107,48 @@ class ExtendKeyRequest(BaseModel):
 # ADMIN AUTH
 # ============================================================
 def check_admin(password: str):
-    if password != ADMIN_PASSWORD:
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="Server chưa cấu hình ADMIN_PASSWORD")
+    if not secrets.compare_digest(password, ADMIN_PASSWORD):
         raise HTTPException(status_code=403, detail="Sai mật khẩu admin")
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _signed_token(key: str, hwid: str, nonce: str) -> str:
+    now = int(time.time())
+    payload = {
+        "v": 1,
+        "product": "ToolAOV",
+        "key_hash": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+        "hwid": hwid,
+        "nonce": nonce,
+        "iat": now,
+        "exp": now + 300,
+    }
+    encoded = _b64url(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    signature = _b64url(SIGNING_PRIVATE_KEY.sign(encoded.encode("ascii")))
+    return f"{encoded}.{signature}"
+
+
+_VERIFY_HITS = defaultdict(deque)
+
+
+def check_verify_rate(request: Request, key: str):
+    """Limit each IP/key pair to 40 verification attempts per minute."""
+    client_ip = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    if not client_ip:
+        client_ip = request.client.host if request.client else "unknown"
+    bucket_id = hashlib.sha256(f"{client_ip}|{key}".encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    hits = _VERIFY_HITS[bucket_id]
+    while hits and now - hits[0] > 60:
+        hits.popleft()
+    if len(hits) >= 40:
+        raise HTTPException(status_code=429, detail="Quá nhiều yêu cầu xác thực, vui lòng thử lại sau")
+    hits.append(now)
 
 # ============================================================
 # API ENDPOINTS
@@ -113,8 +168,9 @@ async def ping():
     return {"status": "ok"}
 
 @app.post("/api/verify")
-async def verify_key(req: VerifyRequest):
+async def verify_key(req: VerifyRequest, request: Request):
     """Xác thực license key + bind HWID."""
+    check_verify_rate(request, req.key)
     rs = await client.execute("SELECT * FROM license_keys WHERE key = ?", (req.key,))
     rows = rs.rows
     
@@ -144,11 +200,18 @@ async def verify_key(req: VerifyRequest):
 
     # HWID binding
     if r_dict["hwid"] is None or r_dict["hwid"] == "":
-        # Lần đầu → bind HWID
+        # Bind có điều kiện để hai máy kích hoạt đồng thời không thể cùng thắng.
         await client.execute(
-            "UPDATE license_keys SET hwid = ?, last_verified = ? WHERE key = ?",
+            """UPDATE license_keys SET hwid = ?, last_verified = ?
+               WHERE key = ? AND (hwid IS NULL OR hwid = '')""",
             (req.hwid, datetime.now().isoformat(), req.key)
         )
+        bound = await client.execute("SELECT hwid FROM license_keys WHERE key = ?", (req.key,))
+        if not bound.rows or bound.rows[0][0] != req.hwid:
+            return JSONResponse(
+                status_code=200,
+                content={"valid": False, "message": "Key đã được dùng trên thiết bị khác"}
+            )
     elif r_dict["hwid"] != req.hwid:
         return JSONResponse(
             status_code=200,
@@ -165,6 +228,7 @@ async def verify_key(req: VerifyRequest):
         "valid": True,
         "message": "OK",
         "expires": r_dict["expires_at"],
+        "token": _signed_token(req.key, req.hwid, req.nonce),
     }
 
 @app.post("/api/admin/keys")
@@ -173,7 +237,7 @@ async def create_key(req: CreateKeyRequest):
     check_admin(req.admin_password)
 
     new_key = secrets.token_hex(16).upper()
-    new_key = "-".join([new_key[i:i+4] for i in range(0, 16, 4)])
+    new_key = "-".join([new_key[i:i+4] for i in range(0, len(new_key), 4)])
 
     now = datetime.now()
     expires = None
