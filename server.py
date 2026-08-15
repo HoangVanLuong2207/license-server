@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 import libsql_client
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 # ============================================================
 # CẤU HÌNH
@@ -44,6 +45,9 @@ try:
     )
 except Exception as error:
     raise RuntimeError("LICENSE_SIGNING_PRIVATE_KEY không phải Ed25519 private key base64 hợp lệ") from error
+
+SIGNING_PUBLIC_KEY = SIGNING_PRIVATE_KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+SIGNING_KEY_FINGERPRINT = hashlib.sha256(SIGNING_PUBLIC_KEY).hexdigest()[:16].upper()
 
 if not TURSO_URL:
     # Nếu không có Turso URL, dùng SQLite local làm fallback
@@ -172,7 +176,7 @@ async def shutdown():
 @app.get("/ping")
 async def ping():
     """Health check — dùng để ping giữ server không bị ngủ."""
-    return {"status": "ok"}
+    return {"status": "ok", "signing_key": SIGNING_KEY_FINGERPRINT}
 
 @app.post("/api/verify")
 async def verify_key(req: VerifyRequest, request: Request):
