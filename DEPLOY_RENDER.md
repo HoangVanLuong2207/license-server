@@ -41,6 +41,9 @@ Vào tab **Environment** trong trang quản lý của Render và thêm các bi�
 1. Sau khi Render báo **"Live"**, copy URL của bạn (VD: `https://garena-license.onrender.com`).
 2. **Test Admin**: Truy cập URL đó trên trình duyệt, đăng nhập bằng `ADMIN_PASSWORD` bạn đã set.
 3. **Cập nhật Client**: Quay lại tool Python của bạn, đổi URL gọi API thành URL mới này.
+4. Sau khi deploy phiên bản có API script, dùng `script_server_admin.py` từ source
+   ToolAOV để đồng bộ `scripts/*.json` vào Turso. Không phát hành client mới trước
+   khi bước đồng bộ báo thành công.
 
 ---
 

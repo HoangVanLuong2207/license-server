@@ -15,6 +15,7 @@ import hashlib
 import base64
 import json
 import os
+import re
 import secrets
 import time
 from collections import defaultdict, deque
@@ -22,7 +23,6 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 import libsql_client
@@ -59,13 +59,6 @@ else:
 
 app = FastAPI(title="License Key Server", version="1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Client Turso phải được tạo sau khi Uvicorn đã khởi động event loop.
 client = None
 
@@ -88,6 +81,15 @@ async def init_db():
             last_verified TEXT DEFAULT NULL
         )
     """)
+    await client.execute("""
+        CREATE TABLE IF NOT EXISTS flow_scripts (
+            name TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1
+        )
+    """)
 
 # ============================================================
 # MODELS
@@ -108,6 +110,20 @@ class ExtendKeyRequest(BaseModel):
     admin_password: str
     days: int
 
+class ScriptAccessRequest(BaseModel):
+    key: str = Field(min_length=8, max_length=128)
+    hwid: str = Field(min_length=16, max_length=128)
+    nonce: str = Field(min_length=16, max_length=128)
+
+class ScriptSyncItem(BaseModel):
+    name: str = Field(min_length=6, max_length=128)
+    content: list[dict]
+
+class ScriptSyncRequest(BaseModel):
+    admin_password: str
+    scripts: list[ScriptSyncItem]
+    replace_all: bool = True
+
 # ============================================================
 # ADMIN AUTH
 # ============================================================
@@ -122,6 +138,12 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
+def _signed_payload(payload: dict) -> str:
+    encoded = _b64url(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    signature = _b64url(SIGNING_PRIVATE_KEY.sign(encoded.encode("ascii")))
+    return f"{encoded}.{signature}"
+
+
 def _signed_token(key: str, hwid: str, nonce: str) -> str:
     now = int(time.time())
     payload = {
@@ -133,12 +155,57 @@ def _signed_token(key: str, hwid: str, nonce: str) -> str:
         "iat": now,
         "exp": now + 300,
     }
-    encoded = _b64url(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    signature = _b64url(SIGNING_PRIVATE_KEY.sign(encoded.encode("ascii")))
-    return f"{encoded}.{signature}"
+    return _signed_payload(payload)
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+
+
+def _script_name(value: str) -> str:
+    name = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.json", name) or ".." in name:
+        raise HTTPException(status_code=400, detail="Tên script không hợp lệ")
+    return name
+
+
+async def _require_bound_license(key: str, hwid: str):
+    """Fail closed unless the key is active, unexpired, and bound to this HWID."""
+    rs = await client.execute(
+        "SELECT hwid, expires_at, is_active FROM license_keys WHERE key = ?",
+        (key,),
+    )
+    if not rs.rows:
+        raise HTTPException(status_code=403, detail="Key không tồn tại")
+    bound_hwid, expires_at, is_active = rs.rows[0]
+    if not is_active:
+        raise HTTPException(status_code=403, detail="Key đã bị khóa")
+    if expires_at and datetime.now() > datetime.fromisoformat(expires_at):
+        raise HTTPException(status_code=403, detail="Key đã hết hạn")
+    if not bound_hwid or not secrets.compare_digest(str(bound_hwid), str(hwid)):
+        raise HTTPException(status_code=403, detail="Key không thuộc thiết bị này")
+
+
+def _script_attestation(kind: str, key: str, hwid: str, nonce: str, **claims) -> str:
+    now = int(time.time())
+    payload = {
+        "v": 1,
+        "product": "ToolAOV",
+        "kind": kind,
+        "key_hash": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+        "hwid": hwid,
+        "nonce": nonce,
+        "iat": now,
+        "exp": now + 120,
+        **claims,
+    }
+    return _signed_payload(payload)
 
 
 _VERIFY_HITS = defaultdict(deque)
+_SCRIPT_HITS = defaultdict(deque)
 
 
 def check_verify_rate(request: Request, key: str):
@@ -153,6 +220,21 @@ def check_verify_rate(request: Request, key: str):
         hits.popleft()
     if len(hits) >= 40:
         raise HTTPException(status_code=429, detail="Quá nhiều yêu cầu xác thực, vui lòng thử lại sau")
+    hits.append(now)
+
+
+def check_script_rate(request: Request, key: str):
+    """Allow normal chains while bounding automated key/resource scraping."""
+    client_ip = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    if not client_ip:
+        client_ip = request.client.host if request.client else "unknown"
+    bucket_id = hashlib.sha256(f"script|{client_ip}|{key}".encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    hits = _SCRIPT_HITS[bucket_id]
+    while hits and now - hits[0] > 60:
+        hits.popleft()
+    if len(hits) >= 300:
+        raise HTTPException(status_code=429, detail="Quá nhiều yêu cầu script, vui lòng thử lại sau")
     hits.append(now)
 
 # ============================================================
@@ -176,7 +258,15 @@ async def shutdown():
 @app.get("/ping")
 async def ping():
     """Health check — dùng để ping giữ server không bị ngủ."""
-    return {"status": "ok", "signing_key": SIGNING_KEY_FINGERPRINT}
+    rs = await client.execute("SELECT COUNT(*) FROM flow_scripts WHERE is_active = 1")
+    script_count = int(rs.rows[0][0]) if rs.rows else 0
+    return {
+        "status": "ok",
+        "signing_key": SIGNING_KEY_FINGERPRINT,
+        "script_api": 1,
+        "scripts_ready": script_count > 0,
+        "script_count": script_count,
+    }
 
 @app.post("/api/verify")
 async def verify_key(req: VerifyRequest, request: Request):
@@ -241,6 +331,110 @@ async def verify_key(req: VerifyRequest, request: Request):
         "expires": r_dict["expires_at"],
         "token": _signed_token(req.key, req.hwid, req.nonce),
     }
+
+
+@app.post("/api/scripts/bundle")
+async def download_script_bundle(req: ScriptAccessRequest, request: Request):
+    """Return scripts only to an active key already bound to this HWID."""
+    check_script_rate(request, req.key)
+    await _require_bound_license(req.key, req.hwid)
+    rs = await client.execute(
+        "SELECT name, content FROM flow_scripts WHERE is_active = 1 ORDER BY name"
+    )
+    scripts = {}
+    for row in rs.rows:
+        name = _script_name(str(row[0]))
+        try:
+            content = json.loads(str(row[1]))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise HTTPException(status_code=500, detail=f"Script hỏng trên server: {name}") from error
+        if not isinstance(content, list):
+            raise HTTPException(status_code=500, detail=f"Script không phải danh sách: {name}")
+        scripts[name] = content
+    if not scripts:
+        raise HTTPException(status_code=503, detail="Server chưa có script hoạt động")
+    bundle_hash = hashlib.sha256(_canonical_json(scripts).encode("utf-8")).hexdigest()
+    return {
+        "scripts": scripts,
+        "attestation": _script_attestation(
+            "script_bundle",
+            req.key,
+            req.hwid,
+            req.nonce,
+            bundle_hash=bundle_hash,
+            script_count=len(scripts),
+        ),
+    }
+
+
+@app.post("/api/scripts/{name}/authorize")
+async def authorize_script_run(name: str, req: ScriptAccessRequest, request: Request):
+    """Issue a short-lived, request-bound ticket immediately before a script runs."""
+    check_script_rate(request, req.key)
+    await _require_bound_license(req.key, req.hwid)
+    name = _script_name(name)
+    rs = await client.execute(
+        "SELECT sha256 FROM flow_scripts WHERE name = ? AND is_active = 1",
+        (name,),
+    )
+    if not rs.rows:
+        raise HTTPException(status_code=404, detail="Script không tồn tại hoặc đã bị khóa")
+    script_hash = str(rs.rows[0][0])
+    return {
+        "authorized": True,
+        "ticket": _script_attestation(
+            "script_run",
+            req.key,
+            req.hwid,
+            req.nonce,
+            script_name=name,
+            script_hash=script_hash,
+        ),
+    }
+
+
+@app.post("/api/admin/scripts/sync")
+async def sync_scripts(req: ScriptSyncRequest):
+    """Upsert the trusted local script set into Turso without publishing it to Git."""
+    check_admin(req.admin_password)
+    if not req.scripts:
+        raise HTTPException(status_code=400, detail="Danh sách script trống")
+    normalized = []
+    seen = set()
+    for item in req.scripts:
+        name = _script_name(item.name)
+        if name in seen:
+            raise HTTPException(status_code=400, detail=f"Trùng tên script: {name}")
+        seen.add(name)
+        content = json.loads(_canonical_json(item.content))
+        canonical = _canonical_json(content)
+        normalized.append(
+            (name, canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+        )
+    if req.replace_all:
+        await client.execute("UPDATE flow_scripts SET is_active = 0")
+    now = datetime.now().isoformat()
+    for name, content, digest in normalized:
+        await client.execute(
+            """INSERT INTO flow_scripts (name, content, sha256, updated_at, is_active)
+               VALUES (?, ?, ?, ?, 1)
+               ON CONFLICT(name) DO UPDATE SET
+                   content = excluded.content,
+                   sha256 = excluded.sha256,
+                   updated_at = excluded.updated_at,
+                   is_active = 1""",
+            (name, content, digest, now),
+        )
+    return {"synced": len(normalized), "replace_all": req.replace_all}
+
+
+@app.get("/api/admin/scripts")
+async def list_scripts_admin(admin_password: str):
+    check_admin(admin_password)
+    rs = await client.execute(
+        "SELECT name, sha256, updated_at, is_active FROM flow_scripts ORDER BY name"
+    )
+    return [{col: row[i] for i, col in enumerate(rs.columns)} for row in rs.rows]
 
 @app.post("/api/admin/keys")
 async def create_key(req: CreateKeyRequest):

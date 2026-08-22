@@ -59,3 +59,15 @@ trong client nên khi đổi key pair phải build lại client.
 
 `POST /api/verify` hiện yêu cầu `key`, `hwid`, `nonce` và trả thêm token ký số
 có hiệu lực 5 phút. Client cũ chưa gửi nonce sẽ không còn tương thích.
+
+## Script resources
+
+The server creates a `flow_scripts` table in Turso automatically. Script JSON is
+uploaded through `POST /api/admin/scripts/sync`; it is not stored in this Git
+repository. `POST /api/scripts/bundle` requires an active license already bound
+to the submitted HWID and returns a signed in-memory bundle. Before every script
+run, the client calls `POST /api/scripts/{name}/authorize` for a short-lived signed
+ticket bound to the key hash, HWID, nonce, script name, and canonical content hash.
+
+Deploy this server version before synchronizing scripts or releasing the matching
+client. Icons remain packaged locally and are not stored by these endpoints.
