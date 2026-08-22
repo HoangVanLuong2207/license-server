@@ -166,7 +166,7 @@ def _canonical_json(value) -> str:
 
 def _script_name(value: str) -> str:
     name = str(value or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.json", name) or ".." in name:
+    if not re.fullmatch(r"[A-Za-z0-9_. -]{1,128}\.json", name) or ".." in name:
         raise HTTPException(status_code=400, detail="Tên script không hợp lệ")
     return name
 
@@ -687,6 +687,19 @@ ADMIN_HTML = """<!DOCTYPE html>
 
   .actions { display: flex; gap: 4px; }
 
+  .script-upload { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .script-upload input[type="file"] {
+    flex: 1;
+    min-width: 260px;
+    padding: 8px;
+    border: 1px dashed #555;
+    border-radius: 6px;
+    background: #16213e;
+    color: #ddd;
+  }
+  .muted { color: #888; font-size: 0.82em; margin-top: 10px; line-height: 1.5; }
+  .hash-text { font-family: Consolas, monospace; color: #aaa; }
+
   .hidden { display: none; }
 </style>
 </head>
@@ -734,6 +747,24 @@ ADMIN_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Script resources -->
+    <div class="card">
+      <h2>☁️ Script Server (<span id="scriptCount">0</span>)</h2>
+      <div class="script-upload">
+        <input type="file" id="scriptFiles" accept=".json,application/json" multiple>
+        <label><input type="checkbox" id="replaceAllScripts" checked> Khóa script cũ không được chọn</label>
+        <button id="uploadScriptsBtn" class="btn btn-primary" onclick="uploadScripts()">Upload scripts</button>
+      </div>
+      <p class="muted">
+        Chọn nhiều file JSON cùng lúc. Mỗi file phải là một danh sách action; dữ liệu được lưu trong Turso,
+        không đưa vào GitHub. Tổng dung lượng một lần upload tối đa 2 MB.
+      </p>
+      <table style="margin-top:12px">
+        <thead><tr><th>Tên script</th><th>SHA-256</th><th>Cập nhật</th><th>Trạng thái</th></tr></thead>
+        <tbody id="scriptTable"></tbody>
+      </table>
+    </div>
+
     <!-- Key List -->
     <div class="card">
       <h2>📋 Danh Sách Key (<span id="keyCount">0</span>)</h2>
@@ -774,6 +805,7 @@ async function login() {
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('adminPanel').classList.remove('hidden');
     loadKeys();
+    loadScripts();
   } catch(e) {
     toast('Lỗi kết nối server', 'error');
   }
@@ -821,6 +853,86 @@ async function loadKeys() {
     `;
     tbody.appendChild(row);
   });
+}
+
+async function loadScripts() {
+  const res = await fetch(`${API}/api/admin/scripts?admin_password=${encodeURIComponent(ADMIN_PASS)}`);
+  if (!res.ok) {
+    document.getElementById('scriptTable').innerHTML = '<tr><td colspan="4">Không thể tải danh sách script</td></tr>';
+    return;
+  }
+  const scripts = await res.json();
+  document.getElementById('scriptCount').textContent = scripts.filter(s => s.is_active).length;
+  const tbody = document.getElementById('scriptTable');
+  tbody.innerHTML = '';
+  scripts.forEach(script => {
+    const row = document.createElement('tr');
+    const updated = script.updated_at ? new Date(script.updated_at).toLocaleString('vi-VN') : '—';
+    const status = script.is_active
+      ? '<span class="badge badge-active">Hoạt động</span>'
+      : '<span class="badge badge-inactive">Đã khóa</span>';
+    row.innerHTML = `
+      <td>${script.name}</td>
+      <td><span class="hash-text" title="${script.sha256}">${script.sha256.substring(0, 12)}...</span></td>
+      <td>${updated}</td>
+      <td>${status}</td>`;
+    tbody.appendChild(row);
+  });
+  if (!scripts.length) {
+    tbody.innerHTML = '<tr><td colspan="4">Chưa có script trên server</td></tr>';
+  }
+}
+
+async function uploadScripts() {
+  const input = document.getElementById('scriptFiles');
+  const files = Array.from(input.files || []);
+  if (!files.length) { toast('Hãy chọn ít nhất một file JSON', 'error'); return; }
+  if (files.reduce((sum, file) => sum + file.size, 0) > 2 * 1024 * 1024) {
+    toast('Tổng dung lượng scripts vượt quá 2 MB', 'error'); return;
+  }
+  const seen = new Set();
+  const scripts = [];
+  try {
+    for (const file of files) {
+      if (!/^[A-Za-z0-9_. -]{1,128}\\.json$/.test(file.name) || file.name.includes('..')) {
+        throw new Error(`Tên file không hợp lệ: ${file.name}`);
+      }
+      if (seen.has(file.name)) throw new Error(`Trùng tên file: ${file.name}`);
+      seen.add(file.name);
+      const content = JSON.parse(await file.text());
+      if (!Array.isArray(content) || !content.every(item => item && typeof item === 'object' && !Array.isArray(item))) {
+        throw new Error(`${file.name} phải chứa một danh sách object JSON`);
+      }
+      scripts.push({name: file.name, content});
+    }
+  } catch (error) {
+    toast(error.message || 'File script không hợp lệ', 'error'); return;
+  }
+
+  const button = document.getElementById('uploadScriptsBtn');
+  button.disabled = true;
+  button.textContent = 'Đang upload...';
+  try {
+    const res = await fetch(`${API}/api/admin/scripts/sync`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        admin_password: ADMIN_PASS,
+        scripts,
+        replace_all: document.getElementById('replaceAllScripts').checked
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Server từ chối upload');
+    toast(`Đã đồng bộ ${data.synced} scripts`);
+    input.value = '';
+    await loadScripts();
+  } catch (error) {
+    toast(error.message || 'Upload scripts thất bại', 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Upload scripts';
+  }
 }
 
 function toggleCustomDate() {

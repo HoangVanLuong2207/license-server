@@ -101,3 +101,10 @@ def test_admin_sync_normalizes_and_hashes_scripts(monkeypatch):
 
     assert response == {"synced": 1, "replace_all": True}
     assert any("ON CONFLICT(name) DO UPDATE" in sql for sql, _ in database.writes)
+
+
+def test_admin_web_panel_supports_multifile_script_upload():
+    assert 'id="scriptFiles"' in server.ADMIN_HTML
+    assert "async function uploadScripts()" in server.ADMIN_HTML
+    assert "/api/admin/scripts/sync" in server.ADMIN_HTML
+    assert "multiple" in server.ADMIN_HTML
