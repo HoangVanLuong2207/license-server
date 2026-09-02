@@ -54,6 +54,9 @@ if not TURSO_URL:
     TURSO_URL = "file:license.db"
 else:
     # Render đôi khi lỗi WebSocket (505), nên ép dùng HTTPS nếu là link libsql://
+    # Giữ nguyên libsql:// cho libsql_client, nhưng log để debug
+    # libsql_client tự đổi libsql:// -> wss://, https:// -> https
+    # Để tránh 400 trên wss, ép https như master
     if TURSO_URL.startswith("libsql://"):
         TURSO_URL = TURSO_URL.replace("libsql://", "https://", 1)
 
@@ -98,6 +101,9 @@ class VerifyRequest(BaseModel):
     key: str = Field(min_length=8, max_length=128)
     hwid: str = Field(min_length=16, max_length=128)
     nonce: str = Field(min_length=16, max_length=128)
+
+class MasterVerifyRequest(BaseModel):
+    key: str = Field(min_length=1, max_length=128)
 
 class CreateKeyRequest(BaseModel):
     admin_password: str
@@ -331,6 +337,55 @@ async def verify_key(req: VerifyRequest, request: Request):
         "expires": r_dict["expires_at"],
         "token": _signed_token(req.key, req.hwid, req.nonce),
     }
+
+
+@app.post("/api/master-verify")
+@app.get("/api/master-verify")
+@app.post("/api/verify-simple")
+@app.get("/api/verify-simple")
+@app.post("/api/check")
+@app.get("/api/check")
+async def master_verify_simple(request: Request):
+    """Verify đơn giản cho master — chỉ cần key, không cần hwid/nonce. Dùng cho checkpass master."""
+    # Lấy key từ JSON body hoặc query
+    key = ""
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                key = str(body.get("key") or body.get("token") or "").strip()
+        except Exception:
+            pass
+    if not key:
+        # Thử query param
+        key = request.query_params.get("key") or request.query_params.get("token") or ""
+        key = key.strip()
+    if not key:
+        # Thử form
+        try:
+            form = await request.form()
+            key = str(form.get("key") or form.get("token") or "").strip()
+        except Exception:
+            pass
+    if not key:
+        return JSONResponse(status_code=200, content={"valid": False, "message": "thiếu key"})
+    # Kiểm tra đơn giản: tồn tại, active, chưa hết hạn (không check hwid)
+    try:
+        rs = await client.execute("SELECT is_active, expires_at FROM license_keys WHERE key = ?", (key,))
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"valid": False, "message": f"DB lỗi: {e}", "error": str(e)[:200]})
+    if not rs.rows:
+        return {"valid": False, "message": "Key không tồn tại"}
+    is_active, expires_at = rs.rows[0]
+    if not is_active:
+        return {"valid": False, "message": "Key đã bị khóa"}
+    if expires_at:
+        try:
+            if datetime.now() > datetime.fromisoformat(expires_at):
+                return {"valid": False, "message": f"Key đã hết hạn ({expires_at})"}
+        except Exception:
+            pass
+    return {"valid": True, "message": "OK", "expires": expires_at}
 
 
 @app.post("/api/scripts/bundle")
