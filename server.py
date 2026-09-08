@@ -33,7 +33,26 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+def _load_env_file(path: str = ".env"):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip("'\"")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except Exception:
+        pass
+
+_load_env_file()
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "license.db")
 SIGNING_PRIVATE_KEY_B64 = os.environ.get("LICENSE_SIGNING_PRIVATE_KEY", "")
@@ -204,7 +223,7 @@ class ScriptSyncRequest(BaseModel):
 def check_admin(password: str):
     if not ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="Server chưa cấu hình ADMIN_PASSWORD")
-    if not secrets.compare_digest(password, ADMIN_PASSWORD):
+    if not secrets.compare_digest(password.strip(), ADMIN_PASSWORD):
         raise HTTPException(status_code=403, detail="Sai mật khẩu admin")
 
 
@@ -999,16 +1018,28 @@ function toast(msg, type='success') {
 }
 
 async function login() {
-  ADMIN_PASS = document.getElementById('adminPass').value;
+  ADMIN_PASS = document.getElementById('adminPass').value.trim();
+  if (!ADMIN_PASS) {
+    toast('Vui lòng nhập mật khẩu admin!', 'error');
+    return;
+  }
   try {
     const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}&_=${Date.now()}`, { cache: 'no-store' });
-    if (res.status === 403) { toast('Sai mật khẩu!', 'error'); return; }
+    if (!res.ok) {
+      let msg = 'Lỗi đăng nhập';
+      try {
+        const err = await res.json();
+        msg = err.detail || msg;
+      } catch(_) {}
+      toast(msg, 'error');
+      return;
+    }
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('adminPanel').classList.remove('hidden');
     loadKeys();
     loadScripts();
   } catch(e) {
-    toast('Lỗi kết nối server', 'error');
+    toast('Lỗi kết nối server: ' + (e.message || e), 'error');
   }
 }
 
@@ -1016,7 +1047,7 @@ async function login() {
 // Treat those values as UTC, then always render them in Vietnam time.
 function parseKeyDate(value) {
   if (!value) return null;
-  const text = String(value);
+  const text = String(value).trim().replace(' ', 'T');
   const hasTimezone = /(?:Z|[+-]\\d{2}:\\d{2})$/i.test(text);
   return new Date(hasTimezone ? text : `${text}Z`);
 }
@@ -1032,49 +1063,72 @@ function formatVietnamDate(value) {
 }
 
 async function loadKeys() {
-  const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}&_=${Date.now()}`, { cache: 'no-store' });
-  const keys = await res.json();
-  document.getElementById('keyCount').textContent = keys.length;
-
   const tbody = document.getElementById('keyTable');
-  tbody.innerHTML = '';
+  try {
+    const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}&_=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) {
+      let msg = 'Không thể tải danh sách key';
+      try {
+        const err = await res.json();
+        msg = err.detail || msg;
+      } catch(_) {}
+      toast(msg, 'error');
+      tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:#dc3545; padding:20px;">Lỗi: ${msg}</td></tr>`;
+      return;
+    }
+    const keys = await res.json();
+    if (!Array.isArray(keys)) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#dc3545; padding:20px;">Dữ liệu server trả về không hợp lệ</td></tr>';
+      return;
+    }
+    document.getElementById('keyCount').textContent = keys.length;
+    tbody.innerHTML = '';
 
-  keys.forEach(k => {
-    const expiresDate = parseKeyDate(k.expires_at);
-    const isExpired = expiresDate && !Number.isNaN(expiresDate.getTime()) && expiresDate < new Date();
-    let status = '';
-    if (!k.is_active) status = '<span class="badge badge-inactive">Đã khóa</span>';
-    else if (isExpired) status = '<span class="badge badge-expired">Hết hạn</span>';
-    else status = '<span class="badge badge-active">Hoạt động</span>';
+    if (keys.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#888; padding:24px;">Chưa có license key nào trong database. Hãy tạo key mới ở form trên!</td></tr>';
+      return;
+    }
 
-    const expires = k.expires_at ? formatVietnamDate(k.expires_at) : 'Vĩnh viễn';
-    const hwid = k.hwid ? k.hwid.substring(0, 8) + '...' : '—';
+    keys.forEach(k => {
+      const expiresDate = parseKeyDate(k.expires_at);
+      const isExpired = expiresDate && !Number.isNaN(expiresDate.getTime()) && expiresDate < new Date();
+      let status = '';
+      if (!k.is_active) status = '<span class="badge badge-inactive">Đã khóa</span>';
+      else if (isExpired) status = '<span class="badge badge-expired">Hết hạn</span>';
+      else status = '<span class="badge badge-active">Hoạt động</span>';
 
-    const row = document.createElement('tr');
-    row.innerHTML = `
-      <td><span class="key-text" onclick="copyKey(this)" title="Click để copy">${k.key}</span></td>
-      <td>${status}</td>
-      <td>${expires}</td>
-      <td>${hwid}</td>
-      <td>${k.note || '—'}</td>
-      <td class="actions">
-        <div style="display:flex; flex-direction:column; gap:4px">
-          <div class="actions">
-            ${k.is_active
-              ? `<button class="btn btn-danger btn-sm" onclick="revokeKey('${k.key}')">Khóa</button>`
-              : `<button class="btn btn-success btn-sm" onclick="activateKey('${k.key}')">Mở</button>`
-            }
-            <button class="btn btn-warning btn-sm" onclick="resetHwid('${k.key}')">Reset HWID</button>
-            <button class="btn btn-danger btn-sm" onclick="purgeKey('${k.key}')">Xóa hẳn</button>
+      const expires = k.expires_at ? formatVietnamDate(k.expires_at) : 'Vĩnh viễn';
+      const hwid = k.hwid ? k.hwid.substring(0, 8) + '...' : '—';
+
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td><span class="key-text" onclick="copyKey(this)" title="Click để copy">${k.key}</span></td>
+        <td>${status}</td>
+        <td>${expires}</td>
+        <td>${hwid}</td>
+        <td>${k.note || '—'}</td>
+        <td class="actions">
+          <div style="display:flex; flex-direction:column; gap:4px">
+            <div class="actions">
+              ${k.is_active
+                ? `<button class="btn btn-danger btn-sm" onclick="revokeKey('${k.key}')">Khóa</button>`
+                : `<button class="btn btn-success btn-sm" onclick="activateKey('${k.key}')">Mở</button>`
+              }
+              <button class="btn btn-warning btn-sm" onclick="resetHwid('${k.key}')">Reset HWID</button>
+              <button class="btn btn-danger btn-sm" onclick="purgeKey('${k.key}')">Xóa hẳn</button>
+            </div>
+            <div class="actions">
+              <button class="btn btn-primary btn-sm" onclick="extendKeyPrompt('${k.key}')">➕ Gia hạn</button>
+            </div>
           </div>
-          <div class="actions">
-            <button class="btn btn-primary btn-sm" onclick="extendKeyPrompt('${k.key}')">➕ Gia hạn</button>
-          </div>
-        </div>
-      </td>
-    `;
-    tbody.appendChild(row);
-  });
+        </td>
+      `;
+      tbody.appendChild(row);
+    });
+  } catch(e) {
+    toast('Lỗi kết nối tải key: ' + (e.message || e), 'error');
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#dc3545; padding:20px;">Không thể kết nối đến server</td></tr>';
+  }
 }
 
 async function loadScripts() {
