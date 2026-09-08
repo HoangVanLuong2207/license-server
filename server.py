@@ -22,7 +22,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -678,10 +678,13 @@ async def issue_checkpass_key_from_aovshop(req: IssueShopKeyRequest, request: Re
     return {"key": key, "expires_at": expires, "order_id": req.order_id, "reused": False}
 
 @app.get("/api/admin/keys")
-async def list_keys(admin_password: str):
+async def list_keys(admin_password: str, response: Response):
     """Danh sách tất cả key."""
     check_admin(admin_password)
 
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     rs = await client.execute("SELECT * FROM license_keys ORDER BY created_at DESC")
     return [{col: row[i] for i, col in enumerate(rs.columns)} for row in rs.rows]
 
@@ -998,7 +1001,7 @@ function toast(msg, type='success') {
 async function login() {
   ADMIN_PASS = document.getElementById('adminPass').value;
   try {
-    const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}`);
+    const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}`, { cache: 'no-store' });
     if (res.status === 403) { toast('Sai mật khẩu!', 'error'); return; }
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('adminPanel').classList.remove('hidden');
@@ -1010,7 +1013,7 @@ async function login() {
 }
 
 async function loadKeys() {
-  const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}`);
+  const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}`, { cache: 'no-store' });
   const keys = await res.json();
   document.getElementById('keyCount').textContent = keys.length;
 
