@@ -1017,7 +1017,7 @@ async function login() {
 function parseKeyDate(value) {
   if (!value) return null;
   const text = String(value);
-  const hasTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(text);
+  const hasTimezone = /(?:Z|[+-]\\d{2}:\\d{2})$/i.test(text);
   return new Date(hasTimezone ? text : `${text}Z`);
 }
 
