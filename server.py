@@ -1,5 +1,5 @@
 """
-License Key Server — FastAPI + Turso (libSQL)
+License Key Server — FastAPI + PostgreSQL / SQLite
 Quản lý license key cho tool Garena Account Manager.
 
 Endpoints:
@@ -17,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
@@ -25,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional
-import libsql_client
+import asyncpg
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -33,9 +34,11 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 # CẤU HÌNH
 # ============================================================
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
-TURSO_URL = os.environ.get("TURSO_URL")         # libSQL URL (VD: libsql://db-name.turso.io)
-TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") # Auth Token từ Turso
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+SQLITE_PATH = os.environ.get("SQLITE_PATH", "license.db")
 SIGNING_PRIVATE_KEY_B64 = os.environ.get("LICENSE_SIGNING_PRIVATE_KEY", "")
+# Shared secret used only by AOVshop to issue a purchased Checkpass license.
+AOVSHOP_ISSUER_TOKEN = os.environ.get("AOVSHOP_ISSUER_TOKEN", "")
 
 if not SIGNING_PRIVATE_KEY_B64:
     raise RuntimeError("Thiếu biến môi trường LICENSE_SIGNING_PRIVATE_KEY")
@@ -49,20 +52,64 @@ except Exception as error:
 SIGNING_PUBLIC_KEY = SIGNING_PRIVATE_KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 SIGNING_KEY_FINGERPRINT = hashlib.sha256(SIGNING_PUBLIC_KEY).hexdigest()[:16].upper()
 
-if not TURSO_URL:
-    # Nếu không có Turso URL, dùng SQLite local làm fallback
-    TURSO_URL = "file:license.db"
-else:
-    # Render đôi khi lỗi WebSocket (505), nên ép dùng HTTPS nếu là link libsql://
-    # Giữ nguyên libsql:// cho libsql_client, nhưng log để debug
-    # libsql_client tự đổi libsql:// -> wss://, https:// -> https
-    # Để tránh 400 trên wss, ép https như master
-    if TURSO_URL.startswith("libsql://"):
-        TURSO_URL = TURSO_URL.replace("libsql://", "https://", 1)
-
 app = FastAPI(title="License Key Server", version="1.0")
 
-# Client Turso phải được tạo sau khi Uvicorn đã khởi động event loop.
+# PostgreSQL is used when DATABASE_URL is configured; SQLite is a local fallback.
+class QueryResult:
+    def __init__(self, rows=(), columns=()):
+        self.rows = rows
+        self.columns = columns
+
+
+class Database:
+    def __init__(self, database_url: str, sqlite_path: str):
+        self.database_url = database_url
+        self.sqlite_path = sqlite_path
+        self.pool = None
+        self.sqlite = None
+
+    async def connect(self):
+        if self.database_url:
+            if not self.database_url.startswith(("postgres://", "postgresql://")):
+                raise RuntimeError("DATABASE_URL phải là PostgreSQL URL (postgresql://...)")
+            self.pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=5)
+        else:
+            self.sqlite = sqlite3.connect(self.sqlite_path, check_same_thread=False)
+
+    @staticmethod
+    def _postgres_sql(sql: str) -> str:
+        index = 0
+        parts = []
+        for char in sql:
+            if char == "?":
+                index += 1
+                parts.append(f"${index}")
+            else:
+                parts.append(char)
+        return "".join(parts)
+
+    async def execute(self, sql: str, args=()):
+        if self.pool:
+            async with self.pool.acquire() as connection:
+                rows = await connection.fetch(self._postgres_sql(sql), *args)
+                columns = tuple(rows[0].keys()) if rows else ()
+                return QueryResult([tuple(row.values()) for row in rows], columns)
+        if self.sqlite is None:
+            raise RuntimeError("Database client chưa được khởi tạo")
+        cursor = self.sqlite.execute(sql, args)
+        self.sqlite.commit()
+        columns = tuple(item[0] for item in cursor.description) if cursor.description else ()
+        return QueryResult(cursor.fetchall() if cursor.description else [], columns)
+
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
+            self.pool = None
+        if self.sqlite:
+            self.sqlite.close()
+            self.sqlite = None
+
+
 client = None
 
 # ============================================================
@@ -81,9 +128,22 @@ async def init_db():
             max_devices INTEGER DEFAULT 1,
             is_active INTEGER DEFAULT 1,
             note TEXT DEFAULT '',
-            last_verified TEXT DEFAULT NULL
+            last_verified TEXT DEFAULT NULL,
+            source TEXT DEFAULT '',
+            external_order_id TEXT DEFAULT NULL
         )
     """)
+    # Safe migration for databases created by an older server version.
+    for statement in (
+        "ALTER TABLE license_keys ADD COLUMN source TEXT DEFAULT ''",
+        "ALTER TABLE license_keys ADD COLUMN external_order_id TEXT DEFAULT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_license_keys_source_order ON license_keys(source, external_order_id)",
+    ):
+        try:
+            await client.execute(statement)
+        except Exception:
+            # Existing column / index is expected after the first startup.
+            pass
     await client.execute("""
         CREATE TABLE IF NOT EXISTS flow_scripts (
             name TEXT PRIMARY KEY,
@@ -108,13 +168,21 @@ class MasterVerifyRequest(BaseModel):
 class CreateKeyRequest(BaseModel):
     admin_password: str
     days: Optional[int] = None  # Số ngày (tùy chọn)
+    hours: Optional[int] = None  # Số giờ (tùy chọn)
     custom_date: Optional[str] = None # YYYY-MM-DD (tùy chọn)
     max_devices: int = 1
     note: str = ""
 
 class ExtendKeyRequest(BaseModel):
     admin_password: str
-    days: int
+    days: Optional[int] = None
+    hours: Optional[int] = None
+
+class IssueShopKeyRequest(BaseModel):
+    order_id: int = Field(gt=0)
+    product_id: int = Field(gt=0)
+    duration_hours: int = Field(gt=0, le=8760)
+    customer_email: Optional[str] = Field(default=None, max_length=320)
 
 class ScriptAccessRequest(BaseModel):
     key: str = Field(min_length=8, max_length=128)
@@ -138,6 +206,19 @@ def check_admin(password: str):
         raise HTTPException(status_code=503, detail="Server chưa cấu hình ADMIN_PASSWORD")
     if not secrets.compare_digest(password, ADMIN_PASSWORD):
         raise HTTPException(status_code=403, detail="Sai mật khẩu admin")
+
+
+def _new_license_key() -> str:
+    raw = secrets.token_hex(16).upper()
+    return "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
+
+
+def _require_aovshop_issuer(request: Request) -> None:
+    if not AOVSHOP_ISSUER_TOKEN:
+        raise HTTPException(status_code=503, detail="Server chưa cấu hình AOVSHOP_ISSUER_TOKEN")
+    supplied = request.headers.get("X-AOVShop-Issuer-Token", "")
+    if not supplied or not secrets.compare_digest(supplied, AOVSHOP_ISSUER_TOKEN):
+        raise HTTPException(status_code=403, detail="Không có quyền cấp key từ AOVshop")
 
 
 def _b64url(data: bytes) -> str:
@@ -250,8 +331,10 @@ def check_script_rate(request: Request, key: str):
 @app.on_event("startup")
 async def startup():
     global client
-    print(f"[*] Connecting Database: {TURSO_URL.split('://')[0]}://***")
-    client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+    target = "PostgreSQL" if DATABASE_URL else f"SQLite ({SQLITE_PATH})"
+    print(f"[*] Connecting Database: {target}")
+    client = Database(DATABASE_URL, SQLITE_PATH)
+    await client.connect()
     await init_db()
 
 @app.on_event("shutdown")
@@ -450,7 +533,7 @@ async def authorize_script_run(name: str, req: ScriptAccessRequest, request: Req
 
 @app.post("/api/admin/scripts/sync")
 async def sync_scripts(req: ScriptSyncRequest):
-    """Upsert the trusted local script set into Turso without publishing it to Git."""
+    """Upsert the trusted local script set into the configured database."""
     check_admin(req.admin_password)
     if not req.scripts:
         raise HTTPException(status_code=400, detail="Danh sách script trống")
@@ -496,8 +579,7 @@ async def create_key(req: CreateKeyRequest):
     """Tạo key mới."""
     check_admin(req.admin_password)
 
-    new_key = secrets.token_hex(16).upper()
-    new_key = "-".join([new_key[i:i+4] for i in range(0, len(new_key), 4)])
+    new_key = _new_license_key()
 
     now = datetime.now()
     expires = None
@@ -507,6 +589,8 @@ async def create_key(req: CreateKeyRequest):
             expires = datetime.fromisoformat(req.custom_date).replace(hour=23, minute=59, second=59).isoformat()
         except ValueError:
             raise HTTPException(status_code=400, detail="Định dạng ngày không hợp lệ (YYYY-MM-DD)")
+    elif req.hours and req.hours > 0:
+        expires = (now + timedelta(hours=req.hours)).isoformat()
     elif req.days and req.days > 0:
         expires = (now + timedelta(days=req.days)).isoformat()
 
@@ -543,11 +627,55 @@ async def extend_key(key: str, req: ExtendKeyRequest):
     if base_date < datetime.now():
         base_date = datetime.now()
     
-    new_expires = (base_date + timedelta(days=req.days)).isoformat()
+    if req.hours and req.hours > 0:
+        duration = timedelta(hours=req.hours)
+        duration_text = f"{req.hours} giờ"
+    elif req.days and req.days > 0:
+        duration = timedelta(days=req.days)
+        duration_text = f"{req.days} ngày"
+    else:
+        raise HTTPException(status_code=400, detail="Cần nhập số giờ hoặc số ngày lớn hơn 0")
+    new_expires = (base_date + duration).isoformat()
     
     await client.execute("UPDATE license_keys SET expires_at = ? WHERE key = ?", (new_expires, key))
     
-    return {"message": f"Đã gia hạn thêm {req.days} ngày", "new_expires": new_expires}
+    return {"message": f"Đã gia hạn thêm {duration_text}", "new_expires": new_expires}
+
+
+@app.post("/api/integrations/aovshop/checkpass-keys")
+async def issue_checkpass_key_from_aovshop(req: IssueShopKeyRequest, request: Request):
+    """Issue one idempotent, hour-based Checkpass key for a paid AOVshop order."""
+    _require_aovshop_issuer(request)
+    order_ref = str(req.order_id)
+    existing = await client.execute(
+        "SELECT key, expires_at FROM license_keys WHERE source=? AND external_order_id=?",
+        ("aovshop-checkpass", order_ref),
+    )
+    if existing.rows:
+        return {"key": existing.rows[0][0], "expires_at": existing.rows[0][1], "order_id": req.order_id, "reused": True}
+
+    now = datetime.now()
+    expires = (now + timedelta(hours=req.duration_hours)).isoformat()
+    key = _new_license_key()
+    note = f"Checkpass | AOVshop order #{req.order_id} | product #{req.product_id}"
+    if req.customer_email:
+        note += f" | {req.customer_email.strip()}"
+    try:
+        await client.execute(
+            """INSERT INTO license_keys (key, created_at, expires_at, max_devices, note, source, external_order_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (key, now.isoformat(), expires, 1, note, "aovshop-checkpass", order_ref),
+        )
+    except Exception:
+        # A retry can race with the first request. Return the one winning key rather than issuing a second.
+        existing = await client.execute(
+            "SELECT key, expires_at FROM license_keys WHERE source=? AND external_order_id=?",
+            ("aovshop-checkpass", order_ref),
+        )
+        if existing.rows:
+            return {"key": existing.rows[0][0], "expires_at": existing.rows[0][1], "order_id": req.order_id, "reused": True}
+        raise
+    return {"key": key, "expires_at": expires, "order_id": req.order_id, "reused": False}
 
 @app.get("/api/admin/keys")
 async def list_keys(admin_password: str):
@@ -568,6 +696,17 @@ async def revoke_key(key: str, admin_password: str):
 
     await client.execute("UPDATE license_keys SET is_active = 0 WHERE key = ?", (key,))
     return {"message": f"Đã khóa key {key}"}
+
+
+@app.delete("/api/admin/keys/{key}/purge")
+async def purge_key(key: str, admin_password: str):
+    """Permanently delete a key. This cannot be undone."""
+    check_admin(admin_password)
+    rs = await client.execute("SELECT key FROM license_keys WHERE key = ?", (key,))
+    if not rs.rows:
+        raise HTTPException(status_code=404, detail="Key không tồn tại")
+    await client.execute("DELETE FROM license_keys WHERE key = ?", (key,))
+    return {"message": f"Đã xóa vĩnh viễn key {key}"}
 
 @app.put("/api/admin/keys/{key}/reset-hwid")
 async def reset_hwid(key: str, admin_password: str):
@@ -783,6 +922,10 @@ ADMIN_HTML = """<!DOCTYPE html>
           <label>Thời hạn</label>
           <select id="keyDays" onchange="toggleCustomDate()">
             <option value="0">Vĩnh viễn</option>
+            <option value="hours:1">1 giờ</option>
+            <option value="hours:6">6 giờ</option>
+            <option value="hours:12">12 giờ</option>
+            <option value="hours:24">24 giờ</option>
             <option value="7">7 ngày</option>
             <option value="30" selected>30 ngày</option>
             <option value="90">90 ngày</option>
@@ -811,7 +954,7 @@ ADMIN_HTML = """<!DOCTYPE html>
         <button id="uploadScriptsBtn" class="btn btn-primary" onclick="uploadScripts()">Upload scripts</button>
       </div>
       <p class="muted">
-        Chọn nhiều file JSON cùng lúc. Mỗi file phải là một danh sách action; dữ liệu được lưu trong Turso,
+        Chọn nhiều file JSON cùng lúc. Mỗi file phải là một danh sách action; dữ liệu được lưu trong database,
         không đưa vào GitHub. Tổng dung lượng một lần upload tối đa 2 MB.
       </p>
       <table style="margin-top:12px">
@@ -899,6 +1042,7 @@ async function loadKeys() {
               : `<button class="btn btn-success btn-sm" onclick="activateKey('${k.key}')">Mở</button>`
             }
             <button class="btn btn-warning btn-sm" onclick="resetHwid('${k.key}')">Reset HWID</button>
+            <button class="btn btn-danger btn-sm" onclick="purgeKey('${k.key}')">Xóa hẳn</button>
           </div>
           <div class="actions">
             <button class="btn btn-primary btn-sm" onclick="extendKeyPrompt('${k.key}')">➕ Gia hạn</button>
@@ -1000,11 +1144,14 @@ function toggleCustomDate() {
 async function createKey() {
   const type = document.getElementById('keyDays').value;
   let days = null;
+  let hours = null;
   let custom_date = null;
 
   if (type === 'custom') {
     custom_date = document.getElementById('keyCustomDate').value;
     if (!custom_date) { toast('Vui lòng chọn ngày!', 'error'); return; }
+  } else if (type.startsWith('hours:')) {
+    hours = parseInt(type.slice(6)) || null;
   } else {
     days = parseInt(type) || null;
   }
@@ -1014,7 +1161,7 @@ async function createKey() {
   const res = await fetch(`${API}/api/admin/keys`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ admin_password: ADMIN_PASS, days, custom_date, note })
+    body: JSON.stringify({ admin_password: ADMIN_PASS, days, hours, custom_date, note })
   });
   if (!res.ok) {
     const err = await res.json();
@@ -1028,19 +1175,21 @@ async function createKey() {
 }
 
 async function extendKeyPrompt(key) {
-  const days = prompt(`Gia hạn thêm bao nhiêu ngày cho key ${key}?`, "30");
-  if (days === null || days === "") return;
-  const daysInt = parseInt(days);
-  if (isNaN(daysInt)) { toast('Số ngày không hợp lệ', 'error'); return; }
+  const duration = prompt(`Gia hạn cho key ${key}. Nhập 6h (giờ) hoặc 30d (ngày):`, "30d");
+  if (duration === null || duration === "") return;
+  const match = String(duration).trim().match(/^(\\d+)\\s*([hHdD])$/);
+  if (!match || Number(match[1]) < 1) { toast('Nhập dạng 6h hoặc 30d', 'error'); return; }
+  const amount = parseInt(match[1]);
+  const payload = match[2].toLowerCase() === 'h' ? {hours: amount} : {days: amount};
 
   const res = await fetch(`${API}/api/admin/keys/${key}/extend`, {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ admin_password: ADMIN_PASS, days: daysInt })
+    body: JSON.stringify({ admin_password: ADMIN_PASS, ...payload })
   });
   
   if (res.ok) {
-    toast(`Đã gia hạn thêm ${daysInt} ngày`);
+    toast(`Đã gia hạn thêm ${duration}`);
     loadKeys();
   } else {
     const err = await res.json();
@@ -1052,6 +1201,14 @@ async function revokeKey(key) {
   if (!confirm(`Khóa key ${key}?`)) return;
   await fetch(`${API}/api/admin/keys/${key}?admin_password=${encodeURIComponent(ADMIN_PASS)}`, { method: 'DELETE' });
   toast('Đã khóa key');
+  loadKeys();
+}
+
+async function purgeKey(key) {
+  if (!confirm(`XÓA VĨNH VIỄN key ${key}? Không thể khôi phục.`)) return;
+  const res = await fetch(`${API}/api/admin/keys/${key}/purge?admin_password=${encodeURIComponent(ADMIN_PASS)}`, { method: 'DELETE' });
+  if (!res.ok) { const err = await res.json(); toast(err.detail || 'Không thể xóa key', 'error'); return; }
+  toast('Đã xóa vĩnh viễn key');
   loadKeys();
 }
 

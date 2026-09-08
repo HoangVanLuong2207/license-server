@@ -1,7 +1,8 @@
-# License Key Server (Turso / libSQL Edition)
+# License Key Server (PostgreSQL / SQLite Edition)
 
-Server API quản lý license key cho ToolAOV, sử dụng Turso (libSQL) và token
-Ed25519 ngắn hạn. Mỗi phản hồi xác thực được ký kèm key, HWID, nonce và hạn token.
+Server API quản lý license key cho ToolAOV, sử dụng PostgreSQL trên VPS (hoặc
+SQLite local khi phát triển) và token Ed25519 ngắn hạn. Mỗi phản hồi xác thực
+được ký kèm key, HWID, nonce và hạn token.
 
 ## Cài đặt
 
@@ -10,31 +11,34 @@ cd license_server
 pip install -r requirements.txt
 ```
 
-## Cấu hình Turso
+## Cấu hình PostgreSQL
 
-Bạn cần tạo database trên [Turso.tech](https://turso.tech) và lấy:
-1. **Turso URL** (VD: `libsql://your-db.turso.io`)
-2. **Auth Token** (API Token)
+Trên VPS, tạo database và user PostgreSQL, sau đó cấu hình:
+
+```text
+DATABASE_URL=postgresql://license_user:mat_khau@127.0.0.1:5432/license_db
+```
+
+Server sẽ tự tạo các bảng `license_keys` và `flow_scripts` khi khởi động.
 
 ## Chạy server
 
 ### Local (Dùng SQLite local làm fallback)
-Nếu không set Turso biến môi trường, server tự tạo file `license.db` local.
+Nếu không set `DATABASE_URL`, server tự tạo file `license.db` local.
 ```bash
 uvicorn server:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### Production (Dùng Turso Cloud)
+### Production (Dùng PostgreSQL trên VPS)
 Set các biến môi trường trước khi chạy:
 ```bash
 # Windows
 set ADMIN_PASSWORD=matkhau_cua_ban
-set TURSO_URL=libsql://your-db-name.turso.io
-set TURSO_AUTH_TOKEN=your_token_here
+set DATABASE_URL=postgresql://license_user:mat_khau@127.0.0.1:5432/license_db
 uvicorn server:app --host 0.0.0.0 --port 8000
 
 # Linux (VPS)
-ADMIN_PASSWORD=xxx TURSO_URL=xxx TURSO_AUTH_TOKEN=xxx uvicorn server:app --host 0.0.0.0 --port 8000
+ADMIN_PASSWORD=xxx DATABASE_URL=postgresql://license_user:mat_khau@127.0.0.1:5432/license_db uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 Hoặc deploy lên **Render.com** (free):
@@ -46,7 +50,7 @@ Hoặc deploy lên **Render.com** (free):
 
 ## Biến ký token bắt buộc
 
-Ngoài cấu hình Turso, production bắt buộc có:
+Ngoài cấu hình database, production bắt buộc có:
 
 ```text
 LICENSE_SIGNING_PRIVATE_KEY=<Ed25519 private key base64>
@@ -62,7 +66,7 @@ có hiệu lực 5 phút. Client cũ chưa gửi nonce sẽ không còn tương 
 
 ## Script resources
 
-The server creates a `flow_scripts` table in Turso automatically. Script JSON is
+The server creates a `flow_scripts` table in PostgreSQL/SQLite automatically. Script JSON is
 uploaded through `POST /api/admin/scripts/sync`; it is not stored in this Git
 repository. `POST /api/scripts/bundle` requires an active license already bound
 to the submitted HWID and returns a signed in-memory bundle. Before every script
