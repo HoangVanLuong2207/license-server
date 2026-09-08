@@ -1012,6 +1012,25 @@ async function login() {
   }
 }
 
+// Older keys were stored as UTC ISO strings without a timezone suffix.
+// Treat those values as UTC, then always render them in Vietnam time.
+function parseKeyDate(value) {
+  if (!value) return null;
+  const text = String(value);
+  const hasTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(text);
+  return new Date(hasTimezone ? text : `${text}Z`);
+}
+
+function formatVietnamDate(value) {
+  const date = parseKeyDate(value);
+  if (!date || Number.isNaN(date.getTime())) return String(value || '—');
+  return date.toLocaleString('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+}
+
 async function loadKeys() {
   const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}`, { cache: 'no-store' });
   const keys = await res.json();
@@ -1021,19 +1040,14 @@ async function loadKeys() {
   tbody.innerHTML = '';
 
   keys.forEach(k => {
-    const isExpired = k.expires_at && new Date(k.expires_at) < new Date();
+    const expiresDate = parseKeyDate(k.expires_at);
+    const isExpired = expiresDate && !Number.isNaN(expiresDate.getTime()) && expiresDate < new Date();
     let status = '';
     if (!k.is_active) status = '<span class="badge badge-inactive">Đã khóa</span>';
     else if (isExpired) status = '<span class="badge badge-expired">Hết hạn</span>';
     else status = '<span class="badge badge-active">Hoạt động</span>';
 
-    const expires = k.expires_at
-      ? new Date(k.expires_at).toLocaleString('vi-VN', {
-          year: 'numeric', month: '2-digit', day: '2-digit',
-          hour: '2-digit', minute: '2-digit', second: '2-digit',
-          hour12: false,
-        })
-      : 'Vĩnh viễn';
+    const expires = k.expires_at ? formatVietnamDate(k.expires_at) : 'Vĩnh viễn';
     const hwid = k.hwid ? k.hwid.substring(0, 8) + '...' : '—';
 
     const row = document.createElement('tr');
