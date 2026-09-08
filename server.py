@@ -1024,7 +1024,13 @@ async function loadKeys() {
     else if (isExpired) status = '<span class="badge badge-expired">Hết hạn</span>';
     else status = '<span class="badge badge-active">Hoạt động</span>';
 
-    const expires = k.expires_at ? new Date(k.expires_at).toLocaleDateString('vi-VN') : 'Vĩnh viễn';
+    const expires = k.expires_at
+      ? new Date(k.expires_at).toLocaleString('vi-VN', {
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit',
+          hour12: false,
+        })
+      : 'Vĩnh viễn';
     const hwid = k.hwid ? k.hwid.substring(0, 8) + '...' : '—';
 
     const row = document.createElement('tr');
