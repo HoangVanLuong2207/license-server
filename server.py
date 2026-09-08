@@ -1001,7 +1001,7 @@ function toast(msg, type='success') {
 async function login() {
   ADMIN_PASS = document.getElementById('adminPass').value;
   try {
-    const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}`, { cache: 'no-store' });
+    const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}&_=${Date.now()}`, { cache: 'no-store' });
     if (res.status === 403) { toast('Sai mật khẩu!', 'error'); return; }
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('adminPanel').classList.remove('hidden');
@@ -1032,7 +1032,7 @@ function formatVietnamDate(value) {
 }
 
 async function loadKeys() {
-  const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}`, { cache: 'no-store' });
+  const res = await fetch(`${API}/api/admin/keys?admin_password=${encodeURIComponent(ADMIN_PASS)}&_=${Date.now()}`, { cache: 'no-store' });
   const keys = await res.json();
   document.getElementById('keyCount').textContent = keys.length;
 
