@@ -54,6 +54,8 @@ _load_env_file()
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+TURSO_URL = os.environ.get("TURSO_URL", "").strip()
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "license.db")
 SIGNING_PRIVATE_KEY_B64 = os.environ.get("LICENSE_SIGNING_PRIVATE_KEY", "")
 # Shared secret used only by AOVshop to issue a purchased Checkpass license.
@@ -81,14 +83,23 @@ class QueryResult:
 
 
 class Database:
-    def __init__(self, database_url: str, sqlite_path: str):
+    def __init__(self, database_url: str, turso_url: str, turso_auth_token: str, sqlite_path: str):
         self.database_url = database_url
+        self.turso_url = turso_url
+        self.turso_auth_token = turso_auth_token
         self.sqlite_path = sqlite_path
         self.pool = None
+        self.turso = None
         self.sqlite = None
 
     async def connect(self):
-        if self.database_url:
+        if self.turso_url:
+            turso_endpoint = self.turso_url
+            if turso_endpoint.startswith("libsql://"):
+                turso_endpoint = turso_endpoint.replace("libsql://", "https://", 1)
+            import libsql_client
+            self.turso = libsql_client.create_client(url=turso_endpoint, auth_token=self.turso_auth_token)
+        elif self.database_url:
             if not self.database_url.startswith(("postgres://", "postgresql://")):
                 raise RuntimeError("DATABASE_URL phải là PostgreSQL URL (postgresql://...)")
             self.pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=5)
@@ -108,6 +119,9 @@ class Database:
         return "".join(parts)
 
     async def execute(self, sql: str, args=()):
+        if self.turso:
+            rs = await self.turso.execute(sql, args)
+            return QueryResult(rs.rows, rs.columns)
         if self.pool:
             async with self.pool.acquire() as connection:
                 rows = await connection.fetch(self._postgres_sql(sql), *args)
@@ -121,6 +135,9 @@ class Database:
         return QueryResult(cursor.fetchall() if cursor.description else [], columns)
 
     async def close(self):
+        if self.turso:
+            await self.turso.close()
+            self.turso = None
         if self.pool:
             await self.pool.close()
             self.pool = None
@@ -350,9 +367,14 @@ def check_script_rate(request: Request, key: str):
 @app.on_event("startup")
 async def startup():
     global client
-    target = "PostgreSQL" if DATABASE_URL else f"SQLite ({SQLITE_PATH})"
+    if TURSO_URL:
+        target = f"Turso ({TURSO_URL.split('://')[0]}://***)"
+    elif DATABASE_URL:
+        target = "PostgreSQL"
+    else:
+        target = f"SQLite ({SQLITE_PATH})"
     print(f"[*] Connecting Database: {target}")
-    client = Database(DATABASE_URL, SQLITE_PATH)
+    client = Database(DATABASE_URL, TURSO_URL, TURSO_AUTH_TOKEN, SQLITE_PATH)
     await client.connect()
     await init_db()
 

@@ -1,4 +1,5 @@
 fastapi
 uvicorn[standard]
 asyncpg
+libsql-client
 cryptography
