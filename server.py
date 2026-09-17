@@ -203,6 +203,7 @@ class MasterVerifyRequest(BaseModel):
 
 class CreateKeyRequest(BaseModel):
     admin_password: str
+    minutes: Optional[int] = Field(default=None, gt=0)
     days: Optional[int] = None  # Số ngày (tùy chọn)
     hours: Optional[int] = None  # Số giờ (tùy chọn)
     custom_date: Optional[str] = None # YYYY-MM-DD (tùy chọn)
@@ -217,7 +218,7 @@ class ExtendKeyRequest(BaseModel):
 class IssueShopKeyRequest(BaseModel):
     order_id: int = Field(gt=0)
     product_id: int = Field(gt=0)
-    duration_hours: int = Field(gt=0, le=8760)
+    duration_hours: float = Field(gt=0, le=8760, allow_inf_nan=False)
     customer_email: Optional[str] = Field(default=None, max_length=320)
 
 class ScriptAccessRequest(BaseModel):
@@ -630,6 +631,8 @@ async def create_key(req: CreateKeyRequest):
             expires = datetime.fromisoformat(req.custom_date).replace(hour=23, minute=59, second=59).isoformat()
         except ValueError:
             raise HTTPException(status_code=400, detail="Định dạng ngày không hợp lệ (YYYY-MM-DD)")
+    elif req.minutes is not None:
+        expires = (now + timedelta(minutes=req.minutes)).isoformat()
     elif req.hours and req.hours > 0:
         expires = (now + timedelta(hours=req.hours)).isoformat()
     elif req.days and req.days > 0:
@@ -966,6 +969,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           <label>Thời hạn</label>
           <select id="keyDays" onchange="toggleCustomDate()">
             <option value="0">Vĩnh viễn</option>
+            <option value="minutes:30">30 phút</option>
             <option value="hours:1">1 giờ</option>
             <option value="hours:6">6 giờ</option>
             <option value="hours:12">12 giờ</option>
@@ -1244,11 +1248,14 @@ async function createKey() {
   const type = document.getElementById('keyDays').value;
   let days = null;
   let hours = null;
+  let minutes = null;
   let custom_date = null;
 
   if (type === 'custom') {
     custom_date = document.getElementById('keyCustomDate').value;
     if (!custom_date) { toast('Vui lòng chọn ngày!', 'error'); return; }
+  } else if (type.startsWith('minutes:')) {
+    minutes = parseInt(type.slice(8)) || null;
   } else if (type.startsWith('hours:')) {
     hours = parseInt(type.slice(6)) || null;
   } else {
@@ -1260,7 +1267,7 @@ async function createKey() {
   const res = await fetch(`${API}/api/admin/keys`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ admin_password: ADMIN_PASS, days, hours, custom_date, note })
+    body: JSON.stringify({ admin_password: ADMIN_PASS, days, hours, minutes, custom_date, note })
   });
   if (!res.ok) {
     const err = await res.json();
