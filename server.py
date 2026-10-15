@@ -616,6 +616,38 @@ async def list_scripts_admin(admin_password: str):
     )
     return [{col: row[i] for i, col in enumerate(rs.columns)} for row in rs.rows]
 
+
+@app.get("/api/admin/scripts/{name}/download")
+async def download_script_admin(name: str, admin_password: str):
+    """Download one stored script as its original JSON resource."""
+    check_admin(admin_password)
+    name = _script_name(name)
+    rs = await client.execute(
+        "SELECT content, sha256 FROM flow_scripts WHERE name = ?",
+        (name,),
+    )
+    if not rs.rows:
+        raise HTTPException(status_code=404, detail="Script không tồn tại")
+
+    content, digest = str(rs.rows[0][0]), str(rs.rows[0][1])
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=500, detail=f"Script hỏng trên server: {name}") from error
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=500, detail=f"Script không phải danh sách: {name}")
+
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "Cache-Control": "no-store",
+            "X-Content-SHA256": digest,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
 @app.post("/api/admin/keys")
 async def create_key(req: CreateKeyRequest):
     """Tạo key mới."""
@@ -1006,7 +1038,7 @@ ADMIN_HTML = """<!DOCTYPE html>
         không đưa vào GitHub. Tổng dung lượng một lần upload tối đa 2 MB.
       </p>
       <table style="margin-top:12px">
-        <thead><tr><th>Tên script</th><th>SHA-256</th><th>Cập nhật</th><th>Trạng thái</th></tr></thead>
+        <thead><tr><th>Tên script</th><th>SHA-256</th><th>Cập nhật</th><th>Trạng thái</th><th>Hành động</th></tr></thead>
         <tbody id="scriptTable"></tbody>
       </table>
     </div>
@@ -1160,7 +1192,7 @@ async function loadKeys() {
 async function loadScripts() {
   const res = await fetch(`${API}/api/admin/scripts?admin_password=${encodeURIComponent(ADMIN_PASS)}`);
   if (!res.ok) {
-    document.getElementById('scriptTable').innerHTML = '<tr><td colspan="4">Không thể tải danh sách script</td></tr>';
+    document.getElementById('scriptTable').innerHTML = '<tr><td colspan="5">Không thể tải danh sách script</td></tr>';
     return;
   }
   const scripts = await res.json();
@@ -1177,11 +1209,45 @@ async function loadScripts() {
       <td>${script.name}</td>
       <td><span class="hash-text" title="${script.sha256}">${script.sha256.substring(0, 12)}...</span></td>
       <td>${updated}</td>
-      <td>${status}</td>`;
+      <td>${status}</td>
+      <td><button class="btn btn-success btn-sm" onclick="downloadScript('${script.name}', this)">Tải xuống</button></td>`;
     tbody.appendChild(row);
   });
   if (!scripts.length) {
-    tbody.innerHTML = '<tr><td colspan="4">Chưa có script trên server</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5">Chưa có script trên server</td></tr>';
+  }
+}
+
+async function downloadScript(name, button) {
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Đang tải...';
+  try {
+    const url = `${API}/api/admin/scripts/${encodeURIComponent(name)}/download?admin_password=${encodeURIComponent(ADMIN_PASS)}`;
+    const res = await fetch(url, {cache: 'no-store'});
+    if (!res.ok) {
+      let message = 'Không thể tải script';
+      try {
+        const error = await res.json();
+        message = error.detail || message;
+      } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+    toast(`Đã tải ${name}`);
+  } catch (error) {
+    toast(error.message || 'Tải script thất bại', 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = oldText;
   }
 }
 

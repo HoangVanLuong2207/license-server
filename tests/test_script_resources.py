@@ -37,6 +37,10 @@ class ResourceDB:
         if compact.startswith("SELECT sha256 FROM flow_scripts"):
             digest = server.hashlib.sha256('[{"action":"wait"}]'.encode()).hexdigest()
             return Result([(digest,)])
+        if compact.startswith("SELECT content, sha256 FROM flow_scripts"):
+            content = '[{"action":"wait"}]'
+            digest = server.hashlib.sha256(content.encode()).hexdigest()
+            return Result([(content, digest)])
         if compact.startswith("SELECT COUNT(*) FROM flow_scripts"):
             return Result([(1,)])
         self.writes.append((compact, args))
@@ -103,8 +107,21 @@ def test_admin_sync_normalizes_and_hashes_scripts(monkeypatch):
     assert any("ON CONFLICT(name) DO UPDATE" in sql for sql, _ in database.writes)
 
 
+def test_admin_can_download_stored_script(monkeypatch):
+    monkeypatch.setattr(server, "client", ResourceDB())
+
+    response = asyncio.run(server.download_script_admin("one.json", "test-admin"))
+
+    assert response.body == b'[{"action":"wait"}]'
+    assert response.media_type == "application/json"
+    assert response.headers["content-disposition"] == 'attachment; filename="one.json"'
+    assert len(response.headers["x-content-sha256"]) == 64
+
+
 def test_admin_web_panel_supports_multifile_script_upload():
     assert 'id="scriptFiles"' in server.ADMIN_HTML
     assert "async function uploadScripts()" in server.ADMIN_HTML
     assert "/api/admin/scripts/sync" in server.ADMIN_HTML
     assert "multiple" in server.ADMIN_HTML
+    assert "async function downloadScript(name, button)" in server.ADMIN_HTML
+    assert "/download?admin_password=" in server.ADMIN_HTML

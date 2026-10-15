@@ -73,5 +73,9 @@ to the submitted HWID and returns a signed in-memory bundle. Before every script
 run, the client calls `POST /api/scripts/{name}/authorize` for a short-lived signed
 ticket bound to the key hash, HWID, nonce, script name, and canonical content hash.
 
+Administrators can download an individual stored JSON file from the web panel or
+through `GET /api/admin/scripts/{name}/download?admin_password=...`. The download
+includes the stored SHA-256 digest in the `X-Content-SHA256` response header.
+
 Deploy this server version before synchronizing scripts or releasing the matching
 client. Icons remain packaged locally and are not stored by these endpoints.
