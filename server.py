@@ -394,6 +394,9 @@ async def ping():
     return {
         "status": "ok",
         "signing_key": SIGNING_KEY_FINGERPRINT,
+        # Public verification material is safe to distribute to clients. The
+        # private signing key never leaves the server environment.
+        "signing_public_key": base64.b64encode(SIGNING_PUBLIC_KEY).decode("ascii"),
         "script_api": 1,
         "scripts_ready": script_count > 0,
         "script_count": script_count,
@@ -460,6 +463,7 @@ async def verify_key(req: VerifyRequest, request: Request):
         "valid": True,
         "message": "OK",
         "expires": r_dict["expires_at"],
+        "signing_public_key": base64.b64encode(SIGNING_PUBLIC_KEY).decode("ascii"),
         "token": _signed_token(req.key, req.hwid, req.nonce),
     }
 

@@ -9,3 +9,6 @@ env/
 *.db
 .vscode/
 .idea/
+build/
+release/
+*.spec
